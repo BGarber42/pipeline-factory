@@ -1,0 +1,190 @@
+name: Reusable AWS CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      aws-role-to-assume:
+        description: IAM role ARN to assume via OIDC
+        required: true
+        type: string
+      aws-region:
+        description: AWS region
+        required: false
+        default: us-east-1
+        type: string
+      ecr-repository-name:
+        description: Target ECR repository name (must exist or role can create)
+        required: true
+        type: string
+      dockerfile-path:
+        description: Path to Dockerfile
+        required: false
+        default: ./Dockerfile
+        type: string
+      context:
+        description: Docker build context
+        required: false
+        default: .
+        type: string
+      image-tag:
+        description: Optional explicit image tag (defaults to short SHA)
+        required: false
+        type: string
+      codeql-languages:
+        description: Comma-separated list of CodeQL languages (e.g. javascript,python,go,java)
+        required: false
+        default: javascript,python,go
+        type: string
+      test-command:
+        description: Optional test command to run (e.g. 'npm ci && npm test')
+        required: false
+        default: ''
+        type: string
+      enable-ecs-deploy:
+        description: If true, update ECS service to new image
+        required: false
+        default: false
+        type: boolean
+      ecs-cluster:
+        required: false
+        type: string
+      ecs-service:
+        required: false
+        type: string
+      ecs-container-name:
+        description: Container name inside the task definition to update
+        required: false
+        type: string
+    outputs:
+      image_tag:
+        description: Final image tag used
+        value: ${{ jobs.ci.outputs.image_tag }}
+      image_uri:
+        description: ECR image URI with tag
+        value: ${{ jobs.ci.outputs.image_uri }}
+      image_digest:
+        description: Pushed image digest
+        value: ${{ jobs.ci.outputs.image_digest }}
+
+jobs:
+  ci:
+    name: CI/CD
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write          # OIDC
+      contents: read
+      security-events: write   # CodeQL SARIF upload
+    outputs:
+      image_tag: ${{ steps.vars.outputs.tag }}
+      image_uri: ${{ steps.img.outputs.uri }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: vars
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.image-tag }}" ]; then
+            TAG="${{ inputs.image-tag }}"
+          else
+            TAG="${GITHUB_SHA::7}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS (OIDC)
+        uses: ./.github/actions/aws-oidc-credentials
+        with:
+          aws-role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Lint and Test
+        if: ${{ inputs.test-command != '' }}
+        run: ${{ inputs.test-command }}
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.codeql-languages }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:multi'
+
+      - name: Trivy scan (source)
+        uses: ./.github/actions/trivy-scan
+        with:
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository-name }}
+          tags: |
+            type=raw,value=${{ steps.vars.outputs.tag }}
+            type=ref,event=tag
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile-path }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Compute image URI
+        id: img
+        shell: bash
+        run: |
+          echo "uri=${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository-name }}:${{ steps.vars.outputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy scan (image)
+        uses: ./.github/actions/trivy-scan
+        with:
+          image-ref: ${{ steps.img.outputs.uri }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Deploy to ECS
+        if: ${{ inputs.enable-ecs-deploy == true }}
+        env:
+          CLUSTER: ${{ inputs.ecs-cluster }}
+          SERVICE: ${{ inputs.ecs-service }}
+          CONTAINER: ${{ inputs.ecs-container-name }}
+          IMAGE: ${{ steps.img.outputs.uri }}
+        shell: bash
+        run: |
+          if [ -z "$CLUSTER" ] || [ -z "$SERVICE" ] || [ -z "$CONTAINER" ]; then
+            echo "ECS deploy requested but ecs-cluster/service/container-name not provided." >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y jq
+          TD_ARN=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)
+          aws ecs describe-task-definition --task-definition "$TD_ARN" --query 'taskDefinition' > td.json
+          jq --arg IMAGE "$IMAGE" --arg NAME "$CONTAINER" '
+            .containerDefinitions = (.containerDefinitions | map(if .name == $NAME then .image = $IMAGE else . end))
+            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
+          ' td.json > new-td.json
+          NEW_TD_ARN=$(aws ecs register-task-definition --cli-input-json file://new-td.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$NEW_TD_ARN"
+          echo "Updated $SERVICE to $NEW_TD_ARN"
